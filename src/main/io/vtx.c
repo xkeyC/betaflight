@@ -29,7 +29,7 @@
 
 #include "common/maths.h"
 #include "common/time.h"
-
+#include "drivers/time.h"
 #include "drivers/vtx_common.h"
 #include "drivers/vtx_table.h"
 
@@ -45,6 +45,12 @@
 #include "pg/pg_ids.h"
 
 #include "vtx.h"
+
+// Variables to track disarm timing and state for VTX power change delay
+// https://github.com/betaflight/betaflight/discussions/13730
+static timeMs_t disarmTimeMs = 0;       // Timestamp of when disarm occurred
+static bool disarmDelayActive = false;  // Whether delay is currently active
+static bool wasArmed = false;           // Previous arm state
 
 PG_REGISTER_WITH_RESET_FN(vtxSettingsConfig_t, vtxSettingsConfig, PG_VTX_SETTINGS_CONFIG, 1);
 
@@ -64,6 +70,7 @@ void pgResetFn_vtxSettingsConfig(vtxSettingsConfig_t *vtxSettingsConfig)
     vtxSettingsConfig->pitModeFreq = VTX_TABLE_DEFAULT_PITMODE_FREQ;
     vtxSettingsConfig->lowPowerDisarm = VTX_LOW_POWER_DISARM_OFF;
     vtxSettingsConfig->softserialAlt = 0;
+    vtxSettingsConfig->disarmDelay = 0;
 }
 
 typedef enum {
@@ -118,6 +125,7 @@ STATIC_UNIT_TESTED vtxSettingsConfig_t vtxGetSettings(void)
         .freq = vtxSettingsConfig()->freq,
         .pitModeFreq = vtxSettingsConfig()->pitModeFreq,
         .lowPowerDisarm = vtxSettingsConfig()->lowPowerDisarm,
+        .disarmDelay = vtxSettingsConfig()->disarmDelay,
     };
 
 #if defined(VTX_SETTINGS_FREQCMD)
@@ -128,7 +136,30 @@ STATIC_UNIT_TESTED vtxSettingsConfig_t vtxGetSettings(void)
     }
 #endif
 
-    if (!ARMING_FLAG(ARMED) && !failsafeIsActive() &&
+    bool isArmed = ARMING_FLAG(ARMED);
+    if (wasArmed && !isArmed && settings.disarmDelay > 0) {
+        disarmTimeMs = millis();
+        disarmDelayActive = true;
+    }
+    
+    wasArmed = isArmed;
+    bool shouldApplyLowPower = false;
+    
+    if (!isArmed) {
+        if (disarmDelayActive) {
+            if ((millis() - disarmTimeMs) >= settings.disarmDelay) {
+                shouldApplyLowPower = true;
+                disarmDelayActive = false;
+            }
+        } else {
+            shouldApplyLowPower = true;
+        }
+    } else {
+        disarmDelayActive = false;
+    }
+
+    // Apply low power settings if applicable
+    if (shouldApplyLowPower && !failsafeIsActive() &&
         (settings.lowPowerDisarm == VTX_LOW_POWER_DISARM_ALWAYS ||
         (settings.lowPowerDisarm == VTX_LOW_POWER_DISARM_UNTIL_FIRST_ARM && !ARMING_FLAG(WAS_EVER_ARMED)))) {
         settings.power = VTX_TABLE_DEFAULT_POWER;
@@ -244,6 +275,7 @@ void vtxUpdate(timeUs_t currentTimeUs)
         return;
     }
 
+    bool isArmed = ARMING_FLAG(ARMED);
     vtxDevice_t *vtxDevice = vtxCommonDevice();
     if (vtxDevice) {
         // Check input sources for config updates
@@ -277,7 +309,9 @@ void vtxUpdate(timeUs_t currentTimeUs)
             currentSchedule = (currentSchedule + 1) % VTX_PARAM_COUNT;
         } while (!vtxUpdatePending && currentSchedule != startingSchedule);
 
-        if (!ARMING_FLAG(ARMED) || vtxUpdatePending) {
+        // Process VTX if armed, update is pending, or not in delay period
+        // During delay period, skip processing to keep VTX in pre-disarm state
+        if (isArmed || vtxUpdatePending || !disarmDelayActive) {
             vtxCommonProcess(vtxDevice, currentTimeUs);
         }
     }
